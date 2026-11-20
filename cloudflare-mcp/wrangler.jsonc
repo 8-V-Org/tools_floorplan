@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mcp-tools-floorplan",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-13",
+  "compatibility_flags": ["nodejs_compat"],
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "Sandbox",
+        "name": "Sandbox"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "new_sqlite_classes": ["Sandbox"],
+      "tag": "v1"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FLOORPLAN_BUCKET",
+      "bucket_name": "tools-floorplan-artifacts"
+    }
+  ]
+}

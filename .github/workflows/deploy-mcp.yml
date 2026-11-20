@@ -1,0 +1,36 @@
+name: Deploy mcp-tools-floorplan
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "cloudflare-mcp/**"
+      - ".github/workflows/deploy-mcp.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloudflare-mcp
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Deploy Worker + Sandbox Container
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: 54025afb4df4757292bd15927cb84b73
+          workingDirectory: cloudflare-mcp
+          wranglerVersion: "4.165.0"
