@@ -1,16 +1,101 @@
 /**
- * Cloudflare Worker + Sandbox MCP Server for 8-V-Org/tools_floorplan
+ * Cloudflare Worker + Sandbox 1.0 MCP Server for 8-V-Org/tools_floorplan
  * Protocol: Model Context Protocol (MCP) JSON-RPC 2024-11-05 over HTTP/POST
  */
 
-import { getSandbox, Sandbox } from "@cloudflare/sandbox";
-
-export { Sandbox };
+import { Files } from "@cloudflare/sandbox";
+import { DurableObject } from "cloudflare:workers";
 
 const SERVER_NAME = "tools-floorplan";
 const SERVER_VERSION = "1.0.0";
 const PROTOCOL_VERSION = "2024-11-05";
 const FLOORPLAN_SCRIPTS = "/opt/floorplan/skills/floorplan/scripts";
+
+export class FloorplanSandbox extends DurableObject {
+  container;
+  files;
+
+  constructor(ctx, env) {
+    super(ctx, env);
+    if (!ctx.container) {
+      throw new Error("No container is configured on FloorplanSandbox");
+    }
+    this.container = ctx.container;
+    this.files = new Files(ctx.container);
+  }
+
+  ensureRunning(enableInternet = true) {
+    if (!this.container.running) {
+      this.container.start({
+        image: this.container.images.base,
+        instance: "lite",
+        enableInternet
+      });
+    }
+  }
+
+  async scanRepo(repoUrl, branch) {
+    this.ensureRunning(true);
+    await this.container.exec(["rm", "-rf", "/workspace/repo"]);
+
+    const cloneArgs = ["git", "clone", "--depth", "1"];
+    if (branch) cloneArgs.push("-b", branch);
+    cloneArgs.push(repoUrl, "/workspace/repo");
+
+    const cloneProc = await this.container.exec(cloneArgs);
+    const cloneOut = await cloneProc.output();
+    if (cloneProc.exitCode !== undefined && cloneProc.exitCode !== 0) {
+      throw new Error(`git clone failed (exit ${cloneProc.exitCode}): ${cloneOut}`);
+    }
+
+    const proc = await this.container.exec([
+      "node",
+      `${FLOORPLAN_SCRIPTS}/scan.mjs`,
+      "/workspace/repo",
+      "--json",
+      "--unattended"
+    ]);
+    return await proc.output();
+  }
+
+  async buildMap(architectureJson, descriptions) {
+    this.ensureRunning(true);
+    await this.container.exec(["mkdir", "-p", "/workspace/repo/floorplan/descriptions"]);
+    await this.files.writeFile(
+      "/workspace/repo/floorplan/architecture.json",
+      JSON.stringify(architectureJson, null, 2)
+    );
+
+    if (descriptions && typeof descriptions === "object") {
+      for (const [filename, content] of Object.entries(descriptions)) {
+        const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+        await this.files.writeFile(
+          `/workspace/repo/floorplan/descriptions/${safeName}`,
+          typeof content === "string" ? content : JSON.stringify(content, null, 2)
+        );
+      }
+    }
+
+    const proc = await this.container.exec([
+      "node",
+      `${FLOORPLAN_SCRIPTS}/build.mjs`,
+      "/workspace/repo",
+      "--json",
+      "--unattended"
+    ]);
+    const buildOut = await proc.output();
+
+    let html = null;
+    try {
+      const readRes = await this.files.readFile("/workspace/repo/floorplan/index.html");
+      html = typeof readRes === "string" ? readRes : readRes?.content ?? null;
+    } catch {
+      html = null;
+    }
+
+    return { buildOut, html };
+  }
+}
 
 const TOOLS = [
   {
@@ -77,27 +162,14 @@ function sanitizeSessionId(raw) {
 async function handleScan(args, env) {
   const { repo_url, branch } = args;
   const sessionId = sanitizeSessionId(args.session_id);
-  const sandbox = getSandbox(env.Sandbox, sessionId);
-
-  const checkoutOpts = { targetDir: "/workspace/repo" };
-  if (branch) checkoutOpts.branch = branch;
-
-  await sandbox.exec("rm -rf /workspace/repo");
-  await sandbox.gitCheckout(repo_url, checkoutOpts);
-
-  const res = await sandbox.exec(
-    `node ${FLOORPLAN_SCRIPTS}/scan.mjs /workspace/repo --json --unattended`
-  );
-
-  if (res.exitCode !== 0 && !res.stdout) {
-    throw new Error(`floorplan scan failed (exit ${res.exitCode}): ${res.stderr}`);
-  }
+  const stub = env.SANDBOX.get(env.SANDBOX.idFromName(sessionId));
+  const rawOut = await stub.scanRepo(repo_url, branch);
 
   let parsed;
   try {
-    parsed = JSON.parse(res.stdout);
+    parsed = JSON.parse(rawOut);
   } catch {
-    parsed = { raw_stdout: res.stdout, stderr: res.stderr };
+    parsed = { raw_stdout: rawOut };
   }
 
   return JSON.stringify({ session_id: sessionId, scan: parsed }, null, 2);
@@ -105,48 +177,25 @@ async function handleScan(args, env) {
 
 async function handleBuild(args, env, requestUrl) {
   const sessionId = sanitizeSessionId(args.session_id);
-  const sandbox = getSandbox(env.Sandbox, sessionId);
-
-  await sandbox.exec("mkdir -p /workspace/repo/floorplan/descriptions");
-  await sandbox.writeFile(
-    "/workspace/repo/floorplan/architecture.json",
-    JSON.stringify(args.architecture_json, null, 2)
-  );
-
-  if (args.descriptions && typeof args.descriptions === "object") {
-    for (const [filename, content] of Object.entries(args.descriptions)) {
-      const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
-      await sandbox.writeFile(
-        `/workspace/repo/floorplan/descriptions/${safeName}`,
-        typeof content === "string" ? content : JSON.stringify(content, null, 2)
-      );
-    }
-  }
-
-  const res = await sandbox.exec(
-    `node ${FLOORPLAN_SCRIPTS}/build.mjs /workspace/repo --json --unattended`
-  );
+  const stub = env.SANDBOX.get(env.SANDBOX.idFromName(sessionId));
+  const { buildOut, html } = await stub.buildMap(args.architecture_json, args.descriptions);
 
   let buildResult;
   try {
-    buildResult = JSON.parse(res.stdout);
+    buildResult = JSON.parse(buildOut);
   } catch {
-    buildResult = { ok: res.exitCode === 0, raw_stdout: res.stdout, stderr: res.stderr };
+    buildResult = { raw_stdout: buildOut };
   }
 
   let artifactUrl = null;
-  if (env.FLOORPLAN_BUCKET) {
+  if (html && env.FLOORPLAN_BUCKET) {
     try {
-      const htmlFile = await sandbox.readFile("/workspace/repo/floorplan/index.html");
-      const htmlContent = typeof htmlFile === "string" ? htmlFile : htmlFile.content;
-      if (htmlContent) {
-        const key = `maps/${sessionId}/index.html`;
-        await env.FLOORPLAN_BUCKET.put(key, htmlContent, {
-          httpMetadata: { contentType: "text/html; charset=utf-8" }
-        });
-        const origin = new URL(requestUrl).origin;
-        artifactUrl = `${origin}/artifacts/${sessionId}/index.html`;
-      }
+      const key = `maps/${sessionId}/index.html`;
+      await env.FLOORPLAN_BUCKET.put(key, html, {
+        httpMetadata: { contentType: "text/html; charset=utf-8" }
+      });
+      const origin = new URL(requestUrl).origin;
+      artifactUrl = `${origin}/artifacts/${sessionId}/index.html`;
     } catch (e) {
       buildResult.artifact_warning = `Failed to archive index.html to R2: ${e.message}`;
     }
@@ -250,7 +299,6 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    // Serve archived floorplan HTML artifacts from R2
     if (request.method === "GET" && url.pathname.startsWith("/artifacts/")) {
       const match = url.pathname.match(/^\/artifacts\/([a-z0-9-]+)\/index\.html$/);
       if (!match || !env.FLOORPLAN_BUCKET) {
@@ -264,7 +312,6 @@ export default {
       });
     }
 
-    // Optional Bearer Auth Guard
     const expectedToken = env.PORTAL_AUTH_TOKEN;
     if (expectedToken) {
       const auth = request.headers.get("authorization") || "";

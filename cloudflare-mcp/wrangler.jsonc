@@ -6,24 +6,29 @@
   "compatibility_flags": ["nodejs_compat"],
   "containers": [
     {
-      "class_name": "Sandbox",
-      "image": "./Dockerfile"
+      "class_name": "FloorplanSandbox",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "base": {
+          "dockerfile": "./Dockerfile"
+        }
+      }
     }
   ],
   "durable_objects": {
     "bindings": [
       {
-        "class_name": "Sandbox",
-        "name": "Sandbox"
+        "class_name": "FloorplanSandbox",
+        "name": "SANDBOX"
       }
     ]
   },
-  "migrations": [
-    {
-      "new_sqlite_classes": ["Sandbox"],
-      "tag": "v1"
+  "exports": {
+    "FloorplanSandbox": {
+      "type": "durable-object",
+      "storage": "sqlite"
     }
-  ],
+  },
   "r2_buckets": [
     {
       "binding": "FLOORPLAN_BUCKET",
